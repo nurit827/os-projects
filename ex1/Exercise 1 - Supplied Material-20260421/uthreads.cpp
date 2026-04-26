@@ -1,9 +1,9 @@
 #include "uthreads.h"
-#include "IdAllocator.cpp"
+#include "IdAllocator.h"
+#include "Thread.h"
 #include <iostream>
 #include <utility>
 #include <algorithm>
-#include "Thread.cpp"
 
 static int running_thread_id;
 // int* running_thread_loc;

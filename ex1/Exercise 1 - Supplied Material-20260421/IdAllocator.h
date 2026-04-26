@@ -1,3 +1,5 @@
+#ifndef IDALLOCATOR_H
+#define IDALLOCATOR_H
 #include <queue>
 #include <vector>
 
@@ -7,8 +9,7 @@ class IdAllocator {
     public:
     int next_id() {
         if (deleted_threads.empty()) {
-            counter++;
-            return counter;
+            return counter++;
         }
         int top = deleted_threads.top();
         deleted_threads.pop();
@@ -19,3 +20,5 @@ class IdAllocator {
         deleted_threads.push(id);
     }
 };
+
+#endif //IDALLOCATOR_H
