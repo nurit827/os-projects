@@ -3,12 +3,13 @@
 #include <iostream>
 #include <utility>
 #include <algorithm>
+#include "Thread.cpp"
 
-int running_thread_id;
-int* running_thread_loc;
+static int running_thread_id;
+// int* running_thread_loc;
 IdAllocator allocator;
-std::deque<std::pair<int,int*>> ready;
-// std::unordered_map<int,int*> 
+static std::deque<int> ready;
+static Thread* threads[MAX_THREAD_NUM];
 
 
 /**
@@ -65,7 +66,7 @@ int uthread_spawn(thread_entry_point entry_point) {
     int* location = (int*)malloc(STACK_SIZE);
     
     // Add the new thread to the end of the READY queue with its ID and stack location
-    ready.push_back({next_id, location});
+    ready.push_back(next_id);
     
     return next_id;
 }
@@ -86,14 +87,14 @@ int uthread_terminate(int tid) {
     // CASE 1: Terminating the main thread (tid 0)
     if (tid == 0) {
         // Release resources of the currently running thread if it's not the main thread
-        if (running_thread_id != 0 && running_thread_loc != nullptr) {
-            free(running_thread_loc);
+        if (running_thread_id != 0 && threads[running_thread_id]->stack != nullptr) {
+            free(threads[running_thread_id]->stack);
         }
 
         // Iterate through the READY queue and free all allocated stacks
-        for (auto& thread_pair : ready) {
-            if (thread_pair.second != nullptr) {
-                free(thread_pair.second);
+        for (int id : ready) {
+            if (threads[id]->stack != nullptr) {
+                free(threads[id]->stack);
             }
         }
         ready.clear();
@@ -105,7 +106,7 @@ int uthread_terminate(int tid) {
     // CASE 2: A thread is trying to terminate itself
     if (tid == running_thread_id) {
         // Free the current thread's stack
-        free(running_thread_loc);
+        free(threads[running_thread_id]->stack);
         // Release the ID back to the allocator
         allocator.delete_id(tid);
         
@@ -188,6 +189,7 @@ int uthread_sleep(int num_quantums) {
     if (num_quantums!=0) {
         return -1;
     }
+
 
 }
 
