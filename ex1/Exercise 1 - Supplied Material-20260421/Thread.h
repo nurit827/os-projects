@@ -11,4 +11,4 @@ struct Thread {
 
 };
 
-#endif //THREAD_H
+#endif

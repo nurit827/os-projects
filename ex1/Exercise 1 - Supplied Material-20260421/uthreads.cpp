@@ -4,13 +4,89 @@
 #include <iostream>
 #include <utility>
 #include <algorithm>
+typedef unsigned long address_t;
+#define JB_SP 6
+#define JB_PC 7
 
 static int running_thread_id;
-// int* running_thread_loc;
 IdAllocator allocator;
 static std::deque<int> ready;
 static Thread* threads[MAX_THREAD_NUM];
+static int total_quantums = 0;
+enum SwitchReason {YIELDING, TERMINATED, BLOCKED, SLEEPING,PREEMPTED};
 
+
+// Internal scheduler function. Saves the outgoing thread's CPU state (if it
+// will live), updates state and bookkeeping, picks the next ready thread,
+// and jumps to it. For TERMINATED, also frees the outgoing thread's resources.
+//
+// This function returns "normally" only on the resume path — when some future
+// siglongjmp brings control back into the sigsetjmp below. On the save path,
+// it ends with siglongjmp and never returns to the original caller.
+static void switch_threads(SwitchReason reason) {
+    Thread* outgoing = threads[running_thread_id];
+
+    // --- Save the outgoing thread's state, if it will live ---
+    if (reason != TERMINATED) {
+        int ret = sigsetjmp(outgoing->env, 1);
+        if (ret != 0) {
+            // Resume path: another thread just siglongjmp'd us back here.
+            // The incoming-thread bookkeeping was already done by whoever
+            // jumped to us, so just return and let the resumed thread continue.
+            return;
+        }
+        // Save path: ret == 0. Fall through to scheduling.
+    }
+
+    // --- Handle the outgoing thread based on why we're switching ---
+    switch (reason) {
+        case YIELDED:
+            outgoing->state = READY;
+            ready.push_back(outgoing->tid);
+            break;
+
+        case BLOCKED_REASON:
+            outgoing->state = BLOCKED;
+            // Not pushed to ready queue. Will be re-added by uthread_resume.
+            break;
+
+        case TERMINATED:
+            // Free the outgoing thread's resources. Note: we are still
+            // running on its stack at this moment. delete[] marks the memory
+            // as freeable but doesn't overwrite it, and the few instructions
+            // remaining before the siglongjmp below will not be disturbed.
+            delete[] outgoing->stack;
+            delete outgoing;
+            threads[running_thread_id] = nullptr;
+            allocator.delete_id(running_thread_id);
+            break;
+
+        // SLEEPING and PREEMPTED will be handled in step 4.
+        default:
+            // Should not reach here in step 3.
+            break;
+    }
+
+    // --- Pick the next thread to run ---
+    // In step 3 the ready queue should never be empty when we get here:
+    // someone always yielded or terminated, and at minimum the main thread
+    // exists. If you hit this assert, you have a bug elsewhere.
+    if (ready.empty()) {
+        std::cerr << "system error: ready queue empty in scheduler\n";
+        exit(1);
+    }
+    int incoming_tid = ready.front();
+    ready.pop_front();
+
+    Thread* incoming = threads[incoming_tid];
+    incoming->state = RUNNING;
+    incoming->quantums += 1;
+    total_quantums += 1;
+    running_thread_id = incoming_tid;
+
+    // --- Jump into the incoming thread. Does not return. ---
+    siglongjmp(incoming->env, 1);
+}
 
 /**
  * @brief initializes the thread library.
@@ -26,12 +102,27 @@ static Thread* threads[MAX_THREAD_NUM];
 */
 int uthread_init(int quantum_usecs) {
     if (quantum_usecs <= 0) {
+        std::cerr << "thread library error: non-positive quantum\n";  // CHANGED: spec requires error msg
         return -1;
     }
-    running_thread_id = 0;
+
+    // Consume tid 0 from the allocator for the main thread.
+    int main_tid = allocator.next_id();   // returns 0
+    total_quantums = 1;                   // spec: total starts at 1, main has run for 1 quantum
+
+    // CHANGED: Create the Thread struct for main and store it in threads[].
+    Thread* main_thread = new Thread();
+    main_thread->tid = main_tid;
+    main_thread->state = RUNNING;
+    main_thread->stack = nullptr;          // main uses the real stack
+    main_thread->quantums = 1;             // spec: total starts at 1, main has run for 1 quantum
+    // Note: don't touch main_thread->env yet. We'll sigsetjmp it the first
+    // time main is switched away from.
+
+    threads[main_tid] = main_thread;
+    running_thread_id = main_tid;
+
     return 0;
-    // std::cerr << "thread library error: " << "did not implement" << std::endl;
-    // return -1;
 }
 
 /**
@@ -48,26 +139,35 @@ int uthread_init(int quantum_usecs) {
 */
 
 int uthread_spawn(thread_entry_point entry_point) {
-    // Check if the provided entry point is valid
     if (entry_point == nullptr) {
-        std::cout << "thread library error: entry point is null pointer" << std::endl;
+        std::cerr << "thread library error: entry point is null pointer\n";  // CHANGED: cerr not cout, and \n
         return -1;
     }
 
-    // Attempt to allocate a new unique ID for the thread
     int next_id = allocator.next_id();
-    
-    // Check if we reached the maximum number of concurrent threads
     if (next_id >= MAX_THREAD_NUM) {
+        // CHANGED: must release the ID we just took, otherwise we lose it forever.
+        allocator.delete_id(next_id);
+        std::cerr << "thread library error: max threads reached\n";
         return -1;
     }
 
-    // Allocate memory for the thread's stack on the heap
-    int* location = (int*)malloc(STACK_SIZE);
-    
-    // Add the new thread to the end of the READY queue with its ID and stack location
+    // CHANGED: stack is char*, allocated with new[]. Was int* via malloc, leaking.
+    char* stack = new char[STACK_SIZE];
+
+    // CHANGED: Create the Thread struct and store the stack pointer in it.
+    Thread* t = new Thread();
+    t->tid = next_id;
+    t->state = READY;
+    t->stack = stack;
+    t->quantums = 0;
+    // Note: jmp_buf setup (sigsetjmp + translate_address for SP and PC) goes
+    // here, but we'll add it when we implement the context switch. For now
+    // the bookkeeping alone is enough to make terminate work.
+
+    threads[next_id] = t;       // CHANGED: actually store it
     ready.push_back(next_id);
-    
+
     return next_id;
 }
 
@@ -83,58 +183,55 @@ int uthread_spawn(thread_entry_point entry_point) {
 */
 
 int uthread_terminate(int tid) {
-    
-    // CASE 1: Terminating the main thread (tid 0)
-    if (tid == 0) {
-        // Release resources of the currently running thread if it's not the main thread
-        if (running_thread_id != 0 && threads[running_thread_id]->stack != nullptr) {
-            free(threads[running_thread_id]->stack);
-        }
-
-        // Iterate through the READY queue and free all allocated stacks
-        for (int id : ready) {
-            if (threads[id]->stack != nullptr) {
-                free(threads[id]->stack);
-            }
-        }
-        ready.clear();
-
-        // End the entire process
-        exit(0);
-    }
-
-    // CASE 2: A thread is trying to terminate itself
-    if (tid == running_thread_id) {
-        // Free the current thread's stack
-        free(threads[running_thread_id]->stack);
-        // Release the ID back to the allocator
-        allocator.delete_id(tid);
-        
-        /* Note: This part requires a context switch to the next READY thread 
-           using siglongjmp. Since this function "does not return", 
-           a simple return statement is not enough here.
-        */
-        return 0; 
-    }
-
-    // CASE 3: Terminating a different thread that is currently in the READY state
-    auto it = std::find_if(ready.begin(), ready.end(), [tid](const std::pair<int, int*>& p) {
-        return p.first == tid;
-    });
-
-    // If the ID was not found in the ready list, return an error
-    if (it == ready.end()) {
+    // CHANGED: validate up front using threads[] as source of truth.
+    if (tid < 0 || tid >= MAX_THREAD_NUM || threads[tid] == nullptr) {
+        std::cerr << "thread library error: terminate on invalid tid\n";  // CHANGED: error msg added
         return -1;
     }
 
-    // Extract the stack pointer, free it, and remove the thread from the queue
-    int* ptr = it->second;
-    free(ptr);
-    ready.erase(it);
-    
-    // Return the ID to the pool for future use
+    // CASE 1: terminating main → exit the whole process.
+    if (tid == 0) {
+        // CHANGED: iterate the full threads[] array (covers RUNNING, READY,
+        // and future BLOCKED). Free both stack and Thread struct (was leaking
+        // the struct). Use delete[]/delete to match new[]/new.
+        for (int i = 0; i < MAX_THREAD_NUM; ++i) {
+            if (threads[i] != nullptr) {
+                delete[] threads[i]->stack;   // delete[] on nullptr is a no-op (safe for main)
+                delete threads[i];
+                threads[i] = nullptr;
+            }
+        }
+        ready.clear();
+        exit(0);
+    }
+
+    // CASE 2: thread terminates itself.
+    if (tid == running_thread_id) {
+        // CHANGED: do NOT free anything here. We're running on this thread's
+        // stack — freeing it then calling another function would execute on
+        // freed memory. Cleanup must happen inside switch_threads, after it
+        // picks the next thread but before siglongjmp'ing into it.
+        // switch_threads(TERMINATED) is not implemented yet — placeholder:
+        // switch_threads(TERMINATED);
+        return 0;   // unreachable once switch_threads exists
+    }
+
+    // CASE 3: terminating some other thread (currently READY in step 3).
+    // CHANGED: ready holds plain int tids, so std::find works. Old code used
+    // find_if with a pair predicate from before the refactor.
+    auto it = std::find(ready.begin(), ready.end(), tid);
+    if (it != ready.end()) {
+        ready.erase(it);
+    }
+    // Note: if not in ready (will happen for BLOCKED in step 4), that's fine —
+    // existence was already validated above.
+
+    // CHANGED: free both stack and struct, use delete[]/delete, null the slot.
+    delete[] threads[tid]->stack;
+    delete threads[tid];
+    threads[tid] = nullptr;
     allocator.delete_id(tid);
-    
+
     return 0;
 }
 
@@ -193,6 +290,16 @@ int uthread_sleep(int num_quantums) {
 
 }
 
+address_t translate_address(address_t addr)
+{
+    address_t ret;
+    asm volatile("xor    %%fs:0x30,%0\n"
+        "rol    $0x11,%0\n"
+                 : "=g" (ret)
+                 : "0" (addr));
+    return ret;
+}
+
 
 /**
  * @brief Returns the thread ID of the calling thread.
@@ -215,8 +322,9 @@ int uthread_get_tid() {
  * @return The total number of quantums.
 */
 int uthread_get_total_quantums() {
-    std::cerr << "thread library error: " << "did not implement" << std::endl;
-    return -1;
+    // std::cerr << "thread library error: " << "did not implement" << std::endl;
+    // return -1;
+    return total_quantums;
 }
 
 
@@ -230,6 +338,7 @@ int uthread_get_total_quantums() {
  * @return On success, return the number of quantums of the thread with ID tid. On failure, return -1.
 */
 int uthread_get_quantums(int tid) {
-    std::cerr << "thread library error: " << "did not implement" << std::endl;
-    return -1;
+    // std::cerr << "thread library error: " << "did not implement" << std::endl;
+    // return -1;
+    return threads[tid]->quantums;
 }
