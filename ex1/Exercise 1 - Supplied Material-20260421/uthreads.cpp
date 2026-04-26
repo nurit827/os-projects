@@ -40,13 +40,13 @@ static void switch_threads(SwitchReason reason) {
 
     // --- Handle the outgoing thread based on why we're switching ---
     switch (reason) {
-        case YIELDED:
+        case YIELDING:
             outgoing->state = READY;
             ready.push_back(outgoing->tid);
             break;
 
-        case BLOCKED_REASON:
-            outgoing->state = BLOCKED;
+        case BLOCKED:
+            outgoing->state = State::BLOCKED;
             // Not pushed to ready queue. Will be re-added by uthread_resume.
             break;
 
