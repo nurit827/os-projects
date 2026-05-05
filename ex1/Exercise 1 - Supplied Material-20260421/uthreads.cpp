@@ -5,6 +5,7 @@
 #include <utility>
 #include <algorithm>
 #include <signal.h>
+#include <sys/time.h>
 typedef unsigned long address_t;
 #define JB_SP 6
 #define JB_PC 7
@@ -14,7 +15,17 @@ IdAllocator allocator;
 static std::deque<int> ready;
 static Thread* threads[MAX_THREAD_NUM];
 static int total_quantums = 0;
+static struct itimerval timer_config;
 enum SwitchReason {YIELDING, TERMINATED, BLOCKING, SLEEPING,PREEMPTED};
+static sigset_t vtalrm_set;
+
+static void block_timer() {
+    sigprocmask(SIG_BLOCK, &vtalrm_set, NULL);
+}
+
+static void unblock_timer() {
+    sigprocmask(SIG_UNBLOCK, &vtalrm_set, NULL);
+}
 
 address_t translate_address(address_t addr)
 {
@@ -76,9 +87,12 @@ static void switch_threads(SwitchReason reason) {
             allocator.delete_id(running_thread_id);
             break;
 
-        // SLEEPING and PREEMPTED will be handled in step 4.
+        case PREEMPTED:
+            outgoing->state = READY;
+            ready.push_back(outgoing->tid);
+            break;
+
         default:
-            // Should not reach here in step 3.
             break;
     }
 
@@ -112,8 +126,18 @@ static void switch_threads(SwitchReason reason) {
             }
         }
     }
+    // Start it
+    if (setitimer(ITIMER_VIRTUAL, &timer_config, NULL) < 0) {
+        std::cerr << "system error: setitimer failed\n";
+        exit(1);
+    }
     // --- Jump into the incoming thread. Does not return. ---
     siglongjmp(incoming->env, 1);
+}
+
+
+static void timer_handler(int sig) {
+    switch_threads(PREEMPTED);
 }
 
 /**
@@ -150,6 +174,30 @@ int uthread_init(int quantum_usecs) {
     threads[main_tid] = main_thread;
     running_thread_id = main_tid;
 
+    sigemptyset(&vtalrm_set);
+    sigaddset(&vtalrm_set, SIGVTALRM);
+    // Install the signal handler
+    struct sigaction sa = {0};
+    sa.sa_handler = &timer_handler;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGVTALRM, &sa, NULL) < 0) {
+        std::cerr << "system error: sigaction failed\n";
+        exit(1);
+    }
+
+
+    // Configure the timer
+    timer_config.it_value.tv_sec  = quantum_usecs / 1000000;
+    timer_config.it_value.tv_usec = quantum_usecs % 1000000;
+    timer_config.it_interval.tv_sec  = quantum_usecs / 1000000;
+    timer_config.it_interval.tv_usec = quantum_usecs % 1000000;
+
+    // Start it
+    if (setitimer(ITIMER_VIRTUAL, &timer_config, NULL) < 0) {
+        std::cerr << "system error: setitimer failed\n";
+        exit(1);
+    }
+
     return 0;
 }
 
@@ -167,8 +215,10 @@ int uthread_init(int quantum_usecs) {
 */
 
 int uthread_spawn(thread_entry_point entry_point) {
+    block_timer();   // CHANGED: block timer while we mess with shared state and do non-atomic operations. Old code didn't block at all.
     if (entry_point == nullptr) {
         std::cerr << "thread library error: entry point is null pointer\n";  // CHANGED: cerr not cout, and \n
+        unblock_timer();
         return -1;
     }
 
@@ -177,6 +227,7 @@ int uthread_spawn(thread_entry_point entry_point) {
         // CHANGED: must release the ID we just took, otherwise we lose it forever.
         allocator.delete_id(next_id);
         std::cerr << "thread library error: max threads reached\n";
+        unblock_timer();
         return -1;
     }
 
@@ -200,6 +251,7 @@ int uthread_spawn(thread_entry_point entry_point) {
     threads[next_id] = t;       // CHANGED: actually store it
     ready.push_back(next_id);
 
+    unblock_timer();
     return next_id;
 }
 
@@ -215,9 +267,11 @@ int uthread_spawn(thread_entry_point entry_point) {
 */
 
 int uthread_terminate(int tid) {
+    block_timer();   // CHANGED: block timer while we mess with shared state and do non-atomic operations. Old code didn't block at all.
     // CHANGED: validate up front using threads[] as source of truth.
     if (tid < 0 || tid >= MAX_THREAD_NUM || threads[tid] == nullptr) {
         std::cerr << "thread library error: terminate on invalid tid\n";  // CHANGED: error msg added
+        unblock_timer();
         return -1;
     }
 
@@ -263,7 +317,7 @@ int uthread_terminate(int tid) {
     delete threads[tid];
     threads[tid] = nullptr;
     allocator.delete_id(tid);
-
+    unblock_timer();
     return 0;
 }
 
@@ -277,12 +331,15 @@ int uthread_terminate(int tid) {
  * @return On success, return 0. On failure, return -1.
 */
 int uthread_block(int tid) {
+    block_timer();   // CHANGED: block timer while we mess with shared state and do non-atomic operations. Old code didn't block at all.
     if (tid < 0 || tid >= MAX_THREAD_NUM || threads[tid] == nullptr) {
         std::cerr << "thread library error: block on invalid tid\n";
+        unblock_timer();    
         return -1;
     }
     if (tid==0) {
         std::cerr << "thread library error: cannot block main thread\n";
+        unblock_timer();
         return -1;
     }
     if (tid == running_thread_id) {
@@ -291,7 +348,8 @@ int uthread_block(int tid) {
         return 0;   // unreachable once switch_threads exists
     }
     Thread* t = threads[tid];
-    if (t->state == BLOCKED) { 
+    if (t->is_blocked) { 
+        unblock_timer();
         return 0; // no-op
           } 
     auto it = std::find(ready.begin(), ready.end(), tid);
@@ -300,6 +358,7 @@ int uthread_block(int tid) {
      }
     t->state = BLOCKED; 
     t->is_blocked = true;
+    unblock_timer();
     return 0;
 }
 
@@ -314,8 +373,10 @@ int uthread_block(int tid) {
  * @return On success, return 0. On failure, return -1.
 */
 int uthread_resume(int tid) {
+    block_timer();   // CHANGED: block timer while we mess with shared state and do non-atomic operations. Old code didn't block at all.
     if (tid < 0 || tid >= MAX_THREAD_NUM || threads[tid] == nullptr) {
         std::cerr << "thread library error: resume on invalid tid\n";
+        unblock_timer();
         return -1;
     }
     Thread* t = threads[tid];
@@ -326,7 +387,7 @@ int uthread_resume(int tid) {
         t->state = READY;
         ready.push_back(tid);
     }
-    
+    unblock_timer();    
     return 0;
 }   
 
@@ -347,12 +408,15 @@ int uthread_resume(int tid) {
  * @return On success, return 0. On failure, return -1.
 */
 int uthread_sleep(int num_quantums) {
+    block_timer();   // CHANGED: block timer while we mess with shared state and do non-atomic operations. Old code didn't block at all.
     if (num_quantums < 0) {
         std::cerr << "thread library error: negative sleep\n";
+        unblock_timer();
         return -1;
     }
     if (running_thread_id == 0 && num_quantums != 0) {
         std::cerr << "thread library error: main cannot sleep\n";
+        unblock_timer();
         return -1;
     }
     if (num_quantums == 0) {

@@ -176,13 +176,12 @@ int main() {
     // ===== Test 7: Multiple threads waking up at the same time =====
     std::cout << "\n--- Test 7: Multiple simultaneous wake-ups ---" << std::endl;
    
-    static int wake_log[10];
     static int wake_idx = 0;
    
     auto sync_sleep_fn = []() {
         int tid = uthread_get_tid();
         uthread_sleep(2);
-        wake_log[wake_idx++] = tid;
+        wake_idx++;
         // immediately terminate
         uthread_terminate(tid);
     };
