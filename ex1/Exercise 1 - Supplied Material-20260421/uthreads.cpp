@@ -4,6 +4,7 @@
 #include <iostream>
 #include <utility>
 #include <algorithm>
+#include <signal.h>
 typedef unsigned long address_t;
 #define JB_SP 6
 #define JB_PC 7
@@ -13,8 +14,17 @@ IdAllocator allocator;
 static std::deque<int> ready;
 static Thread* threads[MAX_THREAD_NUM];
 static int total_quantums = 0;
-enum SwitchReason {YIELDING, TERMINATED, BLOCKED, SLEEPING,PREEMPTED};
+enum SwitchReason {YIELDING, TERMINATED, BLOCKING, SLEEPING,PREEMPTED};
 
+address_t translate_address(address_t addr)
+{
+    address_t ret;
+    asm volatile("xor    %%fs:0x30,%0\n"
+        "rol    $0x11,%0\n"
+                 : "=g" (ret)
+                 : "0" (addr));
+    return ret;
+}
 
 // Internal scheduler function. Saves the outgoing thread's CPU state (if it
 // will live), updates state and bookkeeping, picks the next ready thread,
@@ -45,10 +55,15 @@ static void switch_threads(SwitchReason reason) {
             ready.push_back(outgoing->tid);
             break;
 
-        case BLOCKED:
+        case BLOCKING:
             outgoing->state = State::BLOCKED;
             // Not pushed to ready queue. Will be re-added by uthread_resume.
             break;
+        
+        case SLEEPING:
+            outgoing->state = State::BLOCKED;
+            // Not pushed to ready queue. Will be re-added by the timer handler when sleep is up.
+            break;  
 
         case TERMINATED:
             // Free the outgoing thread's resources. Note: we are still
@@ -83,7 +98,20 @@ static void switch_threads(SwitchReason reason) {
     incoming->quantums += 1;
     total_quantums += 1;
     running_thread_id = incoming_tid;
+    for (int i = 0; i < MAX_THREAD_NUM; ++i) {
+        Thread* t = threads[i];
+        if (t == nullptr) {
+            continue;
+        }
+        if (t->wake_up_time != 0 && total_quantums >= t->wake_up_time) {
+            t->wake_up_time = 0;
 
+            if (!t->is_blocked) {
+                t->state = READY;
+                ready.push_back(i);
+            }
+        }
+    }
     // --- Jump into the incoming thread. Does not return. ---
     siglongjmp(incoming->env, 1);
 }
@@ -161,9 +189,13 @@ int uthread_spawn(thread_entry_point entry_point) {
     t->state = READY;
     t->stack = stack;
     t->quantums = 0;
-    // Note: jmp_buf setup (sigsetjmp + translate_address for SP and PC) goes
-    // here, but we'll add it when we implement the context switch. For now
-    // the bookkeeping alone is enough to make terminate work.
+    
+    address_t sp = (address_t)stack + STACK_SIZE - sizeof(address_t);
+    address_t pc = (address_t)entry_point;
+    sigsetjmp(t->env, 1);
+    (t->env->__jmpbuf)[JB_SP] = translate_address(sp);
+    (t->env->__jmpbuf)[JB_PC] = translate_address(pc);
+    sigemptyset(&t->env->__saved_mask);
 
     threads[next_id] = t;       // CHANGED: actually store it
     ready.push_back(next_id);
@@ -212,7 +244,7 @@ int uthread_terminate(int tid) {
         // freed memory. Cleanup must happen inside switch_threads, after it
         // picks the next thread but before siglongjmp'ing into it.
         // switch_threads(TERMINATED) is not implemented yet — placeholder:
-        // switch_threads(TERMINATED);
+        switch_threads(TERMINATED);
         return 0;   // unreachable once switch_threads exists
     }
 
@@ -245,8 +277,30 @@ int uthread_terminate(int tid) {
  * @return On success, return 0. On failure, return -1.
 */
 int uthread_block(int tid) {
-    std::cerr << "thread library error: " << "did not implement" << std::endl;
-    return -1;
+    if (tid < 0 || tid >= MAX_THREAD_NUM || threads[tid] == nullptr) {
+        std::cerr << "thread library error: block on invalid tid\n";
+        return -1;
+    }
+    if (tid==0) {
+        std::cerr << "thread library error: cannot block main thread\n";
+        return -1;
+    }
+    if (tid == running_thread_id) {
+        threads[tid]->is_blocked = true;
+        switch_threads(BLOCKING);
+        return 0;   // unreachable once switch_threads exists
+    }
+    Thread* t = threads[tid];
+    if (t->state == BLOCKED) { 
+        return 0; // no-op
+          } 
+    auto it = std::find(ready.begin(), ready.end(), tid);
+    if (it != ready.end()) { 
+        ready.erase(it);
+     }
+    t->state = BLOCKED; 
+    t->is_blocked = true;
+    return 0;
 }
 
 
@@ -260,9 +314,21 @@ int uthread_block(int tid) {
  * @return On success, return 0. On failure, return -1.
 */
 int uthread_resume(int tid) {
-    std::cerr << "thread library error: " << "did not implement" << std::endl;
-    return -1;
-}
+    if (tid < 0 || tid >= MAX_THREAD_NUM || threads[tid] == nullptr) {
+        std::cerr << "thread library error: resume on invalid tid\n";
+        return -1;
+    }
+    Thread* t = threads[tid];
+    if (!t->is_blocked) return 0;     // already not blocked → no-op
+    t->is_blocked = false;
+    // Only push to ready if also not sleeping
+    if (t->wake_up_time == 0) {
+        t->state = READY;
+        ready.push_back(tid);
+    }
+    
+    return 0;
+}   
 
 
 /**
@@ -281,24 +347,23 @@ int uthread_resume(int tid) {
  * @return On success, return 0. On failure, return -1.
 */
 int uthread_sleep(int num_quantums) {
-    // std::cerr << "thread library error: " << "did not implement" << std::endl;
-    // return -1;
-    if (num_quantums!=0) {
+    if (num_quantums < 0) {
+        std::cerr << "thread library error: negative sleep\n";
         return -1;
     }
-
-
+    if (running_thread_id == 0 && num_quantums != 0) {
+        std::cerr << "thread library error: main cannot sleep\n";
+        return -1;
+    }
+    if (num_quantums == 0) {
+        switch_threads(YIELDING);
+        return 0;
+    }
+    threads[running_thread_id]->wake_up_time = total_quantums + num_quantums;
+    switch_threads(SLEEPING);
+    return 0;
 }
 
-address_t translate_address(address_t addr)
-{
-    address_t ret;
-    asm volatile("xor    %%fs:0x30,%0\n"
-        "rol    $0x11,%0\n"
-                 : "=g" (ret)
-                 : "0" (addr));
-    return ret;
-}
 
 
 /**
@@ -338,7 +403,9 @@ int uthread_get_total_quantums() {
  * @return On success, return the number of quantums of the thread with ID tid. On failure, return -1.
 */
 int uthread_get_quantums(int tid) {
-    // std::cerr << "thread library error: " << "did not implement" << std::endl;
-    // return -1;
+    if (tid < 0 || tid >= MAX_THREAD_NUM || threads[tid] == nullptr) {
+        std::cerr << "thread library error: get_quantums on invalid tid\n";
+        return -1;
+    }
     return threads[tid]->quantums;
 }
