@@ -70,6 +70,7 @@ int main() {
 
     stop_flag = false;
     int c = uthread_spawn(busy_thread);  // creates work to be preempted
+    (void)c;
 
     static volatile bool sleeper_done = false;
     static int sleeper_quantum_at_wake = 0;
